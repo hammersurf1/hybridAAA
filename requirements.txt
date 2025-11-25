@@ -9,3 +9,5 @@ scikit-learn
 joblib
 yfinance
 tqdm
+matplotlib
+shimmy
