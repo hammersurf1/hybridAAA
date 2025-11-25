@@ -1,0 +1,11 @@
+numpy
+pandas
+gymnasium
+torch
+tensorboard
+stable-baselines3
+xgboost
+scikit-learn
+joblib
+yfinance
+tqdm

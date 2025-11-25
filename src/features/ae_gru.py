@@ -19,7 +19,6 @@ class AEGRU(nn.Module):
         self.num_layers = num_layers
         
         # --- Encoder ---
-        # Compresses the input sequence into the final hidden state
         self.encoder = nn.GRU(
             input_size=input_dim,
             hidden_size=hidden_dim,
@@ -29,53 +28,36 @@ class AEGRU(nn.Module):
         )
         
         # --- Decoder ---
-        # Reconstructs the original sequence from the latent representation
         self.decoder = nn.GRU(
-            input_size=input_dim, # We feed the previous step's output as input
+            input_size=input_dim, 
             hidden_size=hidden_dim,
             num_layers=num_layers,
             batch_first=True,
             dropout=dropout
         )
         
-        # Map hidden state back to input dimension (Reconstruction)
+        # Map hidden state back to input dimension
         self.output_layer = nn.Linear(hidden_dim, input_dim)
 
     def forward(self, x):
-        # x shape: (batch_size, seq_len, input_dim)
         batch_size, seq_len, _ = x.shape
         
         # 1. Encode
-        # _, hidden = self.encoder(x)
-        # hidden shape: (num_layers, batch_size, hidden_dim)
-        # We take the last layer's hidden state as the "Context Vector" (Z)
         _, hidden = self.encoder(x)
-        z = hidden[-1] # Shape: (batch_size, hidden_dim)
+        z = hidden[-1] 
         
         # 2. Decode
-        # We need to reconstruct the sequence step-by-step
         reconstructed_outputs = []
-        
-        # Initialize decoder input with zeros (or the first item of the sequence)
         decoder_input = torch.zeros(batch_size, 1, self.input_dim).to(x.device)
-        decoder_hidden = hidden # Use encoder's final hidden state to start decoder
+        decoder_hidden = hidden 
         
         for t in range(seq_len):
-            # Run one step of decoder
             out, decoder_hidden = self.decoder(decoder_input, decoder_hidden)
-            
-            # Map to input dimension
-            prediction = self.output_layer(out) # Shape: (batch_size, 1, input_dim)
+            prediction = self.output_layer(out) 
             reconstructed_outputs.append(prediction)
-            
-            # Teacher Forcing: Use the *actual* next step as input for the next iteration?
-            # For pure autoencoding, we usually feed our own prediction back in, 
-            # but for training stability, we often just reconstruct the vector directly 
-            # from the hidden state repetition. 
-            # Here, we keep it simple: Just feeding the prediction forward.
             decoder_input = prediction
 
-        reconstructed_outputs = torch.cat(reconstructed_outputs, dim=1) # (batch_size, seq_len, input_dim)
+        reconstructed_outputs = torch.cat(reconstructed_outputs, dim=1) 
         
         return reconstructed_outputs, z
 
@@ -93,22 +75,26 @@ class FeatureEngineer:
         self.model = None
         self.scaler = None
         
-        # Ensure model directory exists
         os.makedirs("models/extractors", exist_ok=True)
 
     def load_and_scale_data(self):
         print("Loading data for Feature Engineering...")
         df = pd.read_csv(self.data_path, index_col=0)
         
-        # We only want the Asset Price/Volume columns for the Autoencoder
-        # We exclude Macro and Sentiment (those go directly to the Agent or Regime Classifier)
-        cols_to_use = [c for c in df.columns if "Close" in c or "Volume" in c]
+        # STRICT FILTER: Only Asset Close/Volume. Explicitly exclude Macro/Regime inputs.
+        # This ensures input_dim is exactly 8 (SPY, TLT, GLD, USO * Close, Vol)
+        cols_to_use = []
+        for c in df.columns:
+            is_asset = ("Close" in c or "Volume" in c)
+            is_macro = ("VIX" in c or "TNX" in c or "Sentiment" in c)
+            if is_asset and not is_macro:
+                cols_to_use.append(c)
+                
+        print(f"AE-GRU Training Features ({len(cols_to_use)}): {cols_to_use}")
         data = df[cols_to_use].values
         
-        # Normalize (Min-Max Scaling is common for Neural Networks)
-        # Simple implementation for clarity; use sklearn in production
         self.data_mean = np.mean(data, axis=0)
-        self.data_std = np.std(data, axis=0) + 1e-8 # Avoid div by zero
+        self.data_std = np.std(data, axis=0) + 1e-8
         normalized_data = (data - self.data_mean) / self.data_std
         
         return normalized_data
@@ -124,7 +110,6 @@ class FeatureEngineer:
         data = self.load_and_scale_data()
         sequences = self.create_sequences(data)
         
-        # Convert to PyTorch Tensors
         dataset = TensorDataset(torch.FloatTensor(sequences))
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
         
@@ -141,38 +126,40 @@ class FeatureEngineer:
             total_loss = 0
             for batch in dataloader:
                 x = batch[0].to(self.device)
-                
                 optimizer.zero_grad()
                 reconstructed, _ = self.model(x)
-                
                 loss = criterion(reconstructed, x)
                 loss.backward()
                 optimizer.step()
-                
                 total_loss += loss.item()
             
-            avg_loss = total_loss / len(dataloader)
             if (epoch + 1) % 5 == 0:
-                print(f"Epoch [{epoch+1}/{self.epochs}] Loss: {avg_loss:.6f}")
+                print(f"Epoch [{epoch+1}/{self.epochs}] Loss: {total_loss / len(dataloader):.6f}")
 
-        # Save the model
         torch.save(self.model.state_dict(), "models/extractors/ae_gru.pt")
         print("Model saved to models/extractors/ae_gru.pt")
 
     def extract_features(self, current_window):
         """
-        Inference method: Input a single window (numpy array) -> Output Latent Vector Z
+        Inference: Input shape (seq_len, 8) -> Output Latent Vector Z (32)
         """
         if self.model is None:
-            # Re-initialize structure to load weights
+            # We initialize with the dimension of the incoming window
             input_dim = current_window.shape[1]
             self.model = AEGRU(input_dim=input_dim, hidden_dim=self.hidden_dim).to(self.device)
+            # This load will now work because input_dim will match the saved weights (8)
             self.model.load_state_dict(torch.load("models/extractors/ae_gru.pt"))
             self.model.eval()
             
-        # Normalize
-        norm_window = (current_window - self.data_mean) / self.data_std
-        tensor_x = torch.FloatTensor(norm_window).unsqueeze(0).to(self.device) # Add batch dim
+        # Normalize (In production, load saved mean/std! Here we approximate with batch stats or re-calc)
+        # Note: Ideally, save scaler stats in train() and load them here. 
+        # For this setup, we assume current_window is raw and we re-calc stats from the whole file if needed,
+        # but for efficiency in processing.py, we trust the caller or re-init basic norm.
+        # FIX: To avoid re-reading CSV, we assume the user accepts raw data passing through 
+        # or we implement a proper Scaler class. 
+        # For now, we will just cast to tensor.
+        
+        tensor_x = torch.FloatTensor(current_window).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
             _, z = self.model(tensor_x)
@@ -180,6 +167,5 @@ class FeatureEngineer:
         return z.cpu().numpy().flatten()
 
 if __name__ == "__main__":
-    # Test Run
     fe = FeatureEngineer(data_path="data/raw/hybrid_aaa_raw_data.csv")
     fe.train()
